@@ -63,8 +63,11 @@ If the argument is NOT a path to a PDF or EPUB file, stop and respond:
 ## Step 1 — Validate input
 
 ```bash
-test -f "$0" && echo "FILE_OK" || echo "FILE_NOT_FOUND: $0"
-file "$0" | grep -iE "pdf|epub|zip" && echo "FORMAT_OK" || echo "FORMAT_UNKNOWN"
+BOOK_PATH="$1"
+SKILL_NAME_ARG="${2:-}"
+test -f "$BOOK_PATH" && echo "FILE_OK" || echo "FILE_NOT_FOUND: $BOOK_PATH"
+file "$BOOK_PATH" | grep -iE "pdf|epub|zip" \
+    && echo "FORMAT_OK" || echo "FORMAT_UNKNOWN"
 ```
 
 Check the file extension (`.pdf` or `.epub`) or magic bytes (`%PDF` or `PK` zip header).
@@ -101,7 +104,7 @@ Store the answer as `BOOK_TYPE`:
 Run the extraction script, passing the book type:
 
 ```bash
-python3 ~/.claude/skills/book-to-skill/scripts/extract.py "$0" --mode <BOOK_TYPE>
+python3 ~/.claude/skills/book-to-skill/scripts/extract.py "$BOOK_PATH" --mode <BOOK_TYPE>
 ```
 
 - `--mode technical` → uses Docling (layout-aware, preserves tables and code blocks as markdown)
@@ -200,7 +203,7 @@ Use the answer to weight what gets highlighted in the SKILL.md Core section.
 
 ## Step 5 — Determine skill name
 
-If `$1` was provided, use it as the skill slug.
+If `$SKILL_NAME_ARG` is non-empty, use it as the skill slug.
 Otherwise, propose two options and let the user choose:
 - **By author-concept**: `{author-lastname}-{core-concept}` (e.g. `cialdini-influence`, `meadows-systems`)
 - **By title**: lowercase hyphens from book title (e.g. `designing-data-intensive-apps`)
@@ -232,7 +235,7 @@ Read the corresponding section of `/tmp/book_skill_work/full_text.txt` (use char
 
 Create `~/.claude/skills/<skill_name>/chapters/ch<NN>-<slug>.md` using the structure below.
 
-**Adapt emphasis based on `BOOK_TYPE`:**
+**Adapt emphasis based on `extraction_mode_used` from `metadata.json`:**
 - `technical` → prioritize "Code Examples", "Reference Tables", and "Commands & APIs" sections; preserve exact syntax
 - `text` → prioritize "Frameworks Introduced", "Mental Models", and "Key Takeaways"; skip empty technical sections
 

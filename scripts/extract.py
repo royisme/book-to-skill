@@ -20,6 +20,7 @@ import html
 import html.parser
 import json
 import os
+import os.path
 import re
 import shutil
 import subprocess
@@ -129,25 +130,63 @@ class _HTMLTextExtractor(html.parser.HTMLParser):
 
 
 def extract_with_zipfile(epub_path: str) -> str | None:
-    """stdlib-only EPUB extractor: unzip → parse HTML files."""
+    """stdlib-only EPUB extractor: unzip → parse OPF spine → extract HTML."""
     try:
+        import xml.etree.ElementTree as ET
         with zipfile.ZipFile(epub_path) as zf:
-            names = zf.namelist()
-            # Read OPF spine to get reading order, fall back to sorted xhtml files
-            spine_order: list[str] = []
-            opf_files = [n for n in names if n.endswith(".opf")]
-            if opf_files:
-                opf_text = zf.read(opf_files[0]).decode("utf-8", errors="replace")
-                spine_order = re.findall(r'href=["\']([^"\']+\.(?:xhtml|html))["\']', opf_text)
-
-            html_files = spine_order or sorted(
-                n for n in names if n.endswith((".html", ".xhtml"))
-            )
-            if not html_files:
+            names = set(zf.namelist())
+            # Find the OPF (rootfile) via container.xml; fall back to *.opf scan
+            opf_path: str | None = None
+            try:
+                container = zf.read("META-INF/container.xml").decode(
+                    "utf-8", errors="replace"
+                )
+                m = re.search(r'full-path=["\']([^"\']+)["\']', container)
+                if m:
+                    opf_path = m.group(1)
+            except KeyError:
+                pass
+            if not opf_path:
+                opf_candidates = [n for n in names if n.endswith(".opf")]
+                if not opf_candidates:
+                    return None
+                opf_path = opf_candidates[0]
+            opf_dir = os.path.dirname(opf_path)
+            opf_text = zf.read(opf_path).decode("utf-8", errors="replace")
+            # Strip XML namespaces to make ElementTree queries simple
+            opf_text_clean = re.sub(r'\sxmlns(:[^=]+)?="[^"]+"', "", opf_text, count=0)
+            try:
+                root = ET.fromstring(opf_text_clean)
+            except ET.ParseError:
                 return None
-
-            parts = []
-            for name in html_files:
+            # Build manifest: id -> href
+            manifest: dict[str, str] = {}
+            for item in root.findall(".//manifest/item"):
+                item_id = item.get("id")
+                href = item.get("href")
+                if item_id and href:
+                    manifest[item_id] = href
+            # Resolve spine in reading order
+            spine_files: list[str] = []
+            for itemref in root.findall(".//spine/itemref"):
+                idref = itemref.get("idref")
+                if not idref or idref not in manifest:
+                    continue
+                href = manifest[idref]
+                full = os.path.normpath(
+                    os.path.join(opf_dir, href) if opf_dir else href
+                ).replace("\\", "/")
+                if full in names:
+                    spine_files.append(full)
+            # Fall back: any html/xhtml under the archive
+            if not spine_files:
+                spine_files = sorted(
+                    n for n in names if n.lower().endswith((".html", ".xhtml"))
+                )
+            if not spine_files:
+                return None
+            parts: list[str] = []
+            for name in spine_files:
                 try:
                     raw = zf.read(name).decode("utf-8", errors="replace")
                     parser = _HTMLTextExtractor()
@@ -198,8 +237,8 @@ def count_epub_chapters(epub_path: str) -> int:
         return 0
 
 
-def count_pages(pdf_path: str) -> int:
-    # Try pdfinfo first
+def count_pages(pdf_path: str, extracted_text: str | None = None) -> int:
+    """Count pages, preferring metadata sources, then form-feed in extracted text."""
     if shutil.which("pdfinfo"):
         try:
             result = subprocess.run(
@@ -210,7 +249,9 @@ def count_pages(pdf_path: str) -> int:
                     return int(line.split(":")[1].strip())
         except Exception:
             pass
-    # Fallback: count form-feed chars (pdftotext -layout uses \f between pages)
+    # pdftotext (default and -layout) emits \f between pages
+    if extracted_text and "\f" in extracted_text:
+        return extracted_text.count("\f") + 1
     try:
         import PyPDF2
         with open(pdf_path, "rb") as f:
@@ -219,27 +260,45 @@ def count_pages(pdf_path: str) -> int:
         return 0
 
 
+CHAPTER_PATTERN = re.compile(
+    r"^\s*("
+    r"chapter\s+\d+(?:[\.:]|\s|$)"
+    r"|chapter\s+[ivxlcdm]+(?:[\.:]|\s|$)"
+    r"|ch\.\s*\d+\b"
+    r"|part\s+(?:\d+|[ivxlcdm]+)(?:[\.:]|\s|$)"
+    r"|第[\d一二三四五六七八九十百千零]+[章篇部回節节]"
+    r")",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
 def detect_structure(text: str) -> dict:
-    """Detect chapter count and table of contents presence."""
-    import re
-    lines = text[:50000].splitlines()
-
-    # Look for chapter headings
-    chapter_pattern = re.compile(
-        r"^\s*(chapter\s+\d+|CHAPTER\s+\d+|ch\.\s*\d+|\d+\.\s+[A-Z])",
-        re.IGNORECASE
-    )
-    chapters_found = [l.strip() for l in lines if chapter_pattern.match(l)]
-
-    # Look for ToC indicators
-    toc_keywords = ["table of contents", "contents", "índice", "sumário"]
+    """Detect chapter count and table of contents presence.
+    Scans the entire text, not just the first 50K chars."""
+    matches = list(CHAPTER_PATTERN.finditer(text))
+    headings_sample = []
+    for m in matches[:10]:
+        line_end = text.find("\n", m.start())
+        line = text[m.start(): line_end if line_end != -1 else m.start() + 120]
+        headings_sample.append(line.strip())
+    toc_keywords = ["table of contents", "contents", "目录", "目錄", "índice", "sumário"]
     has_toc = any(kw in text[:5000].lower() for kw in toc_keywords)
-
     return {
-        "chapters_detected": len(chapters_found),
-        "chapter_headings_sample": chapters_found[:10],
+        "chapters_detected": len(matches),
+        "chapter_headings_sample": headings_sample,
         "has_toc": has_toc,
     }
+
+
+def _is_epub_zip(path: str) -> bool:
+    """Per EPUB spec, the first entry must be uncompressed 'mimetype' file
+    containing exactly 'application/epub+zip'."""
+    try:
+        with zipfile.ZipFile(path) as zf:
+            mimetype = zf.read("mimetype").decode("ascii", errors="replace").strip()
+            return mimetype == "application/epub+zip"
+    except (zipfile.BadZipFile, KeyError):
+        return False
 
 
 def extract_with_docling(pdf_path: str) -> str | None:
@@ -282,6 +341,7 @@ def main():
             extraction_mode = sys.argv[idx + 1].lower()
     if extraction_mode not in ("technical", "text"):
         extraction_mode = "text"
+    requested_mode = extraction_mode
 
     if not os.path.exists(input_path):
         print(f"ERROR: File not found: {input_path}", file=sys.stderr)
@@ -297,11 +357,12 @@ def main():
             header = f.read(8)
         if header[:4] == b"%PDF":
             is_pdf = True
-        elif header[:2] == b"PK":  # ZIP magic → likely EPUB
+        elif header[:2] == b"PK" and _is_epub_zip(input_path):
             is_epub = True
         else:
             print(
-                f"ERROR: Unsupported format '{ext}'. Supported: .pdf, .epub",
+                f"ERROR: Unsupported format. Detected ZIP but not EPUB.\n"
+                f"Supported: .pdf, .epub",
                 file=sys.stderr,
             )
             sys.exit(1)
@@ -324,6 +385,12 @@ def main():
             else:
                 print("not available, falling back to pdftotext")
                 extraction_mode = "text"
+                print(
+                    "\n⚠️  WARNING: Technical mode requested but Docling not available.\n"
+                    "   Falling back to text mode — tables and code blocks will be flattened.\n"
+                    "   Install with: pip3 install docling\n",
+                    file=sys.stderr,
+                )
 
         if extraction_mode == "text":
             print("Mode: text — using pdftotext...")
@@ -359,7 +426,7 @@ def main():
                         )
                         sys.exit(1)
 
-        pages = count_pages(input_path)
+        pages = count_pages(input_path, extracted_text=text)
         pages_label = "pages"
 
     # Write full text
@@ -374,7 +441,8 @@ def main():
         "filename": Path(input_path).name,
         "format": "epub" if is_epub else "pdf",
         "extraction_method": method,
-        "extraction_mode": extraction_mode,
+        "extraction_mode_requested": requested_mode,
+        "extraction_mode_used": extraction_mode,
         "file_size_mb": round(file_size_mb, 2),
         pages_label: pages,
         "chars": len(text),
