@@ -225,13 +225,23 @@ mkdir -p ~/.claude/skills/<skill_name>/chapters
 
 ## Step 7 — Generate chapter summaries
 
+**Resume rule**: Before generating each chapter file, check whether it already exists
+and is non-trivial:
+```bash
+EXISTING=$(ls ~/.claude/skills/<skill_name>/chapters/ch<NN>-*.md 2>/dev/null | head -1)
+if [ -n "$EXISTING" ] && [ "$(wc -c < "$EXISTING")" -gt 500 ]; then
+    echo "Chapter <NN> already exists at $EXISTING — skipping."
+    # continue to next chapter
+fi
+```
+If a chapter file is empty or under 500 bytes, treat it as incomplete and regenerate.
+
 **TOKEN BUDGET RULE — CRITICAL:**
 - Each chapter summary file: **800–1,200 tokens** (dense, not verbose)
 - Files are loaded on-demand — they are NOT capped per se, but keep them useful and tight
 
-For EACH chapter/major section identified in Step 3:
-
-Read the corresponding section of `/tmp/book_skill_work/full_text.txt` (use character offsets or grep for chapter headings).
+Read `chapters` array from `/tmp/book_skill_work/metadata.json`. For each entry,
+slice `full_text.txt` by `[offset, end_offset]` — do NOT grep for headings.
 
 Create `~/.claude/skills/<skill_name>/chapters/ch<NN>-<slug>.md` using the structure below.
 

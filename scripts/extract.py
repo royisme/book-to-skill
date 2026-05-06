@@ -32,11 +32,17 @@ OUTPUT_DIR = Path("/tmp/book_skill_work")
 OUTPUT_TEXT = OUTPUT_DIR / "full_text.txt"
 OUTPUT_META = OUTPUT_DIR / "metadata.json"
 
-WORDS_PER_TOKEN = 0.75  # approximate
-
-
 def estimate_tokens(text: str) -> int:
-    return int(len(text.split()) / WORDS_PER_TOKEN)
+    """Token count estimator. Tries tiktoken first, falls back to chars/4."""
+    try:
+        import tiktoken
+        enc = tiktoken.get_encoding("cl100k_base")
+        return len(enc.encode(text, disallowed_special=()))
+    except ImportError:
+        # 4 chars/token works across English prose, code, and CJK
+        return max(1, len(text) // 4)
+    except Exception:
+        return max(1, len(text) // 4)
 
 
 def extract_with_pdftotext(pdf_path: str) -> str | None:
@@ -290,6 +296,23 @@ def detect_structure(text: str) -> dict:
     }
 
 
+def find_chapter_boundaries(text: str) -> list[dict]:
+    """Locate chapter starts and end offsets. End of chapter N == start of N+1."""
+    boundaries: list[dict] = []
+    for m in CHAPTER_PATTERN.finditer(text):
+        line_end = text.find("\n", m.start())
+        if line_end == -1:
+            line_end = m.start() + 120
+        title = text[m.start():line_end].strip()
+        boundaries.append({"title": title, "offset": m.start()})
+    for i, b in enumerate(boundaries):
+        b["end_offset"] = (
+            boundaries[i + 1]["offset"] if i + 1 < len(boundaries) else len(text)
+        )
+        b["char_count"] = b["end_offset"] - b["offset"]
+    return boundaries
+
+
 def _is_epub_zip(path: str) -> bool:
     """Per EPUB spec, the first entry must be uncompressed 'mimetype' file
     containing exactly 'application/epub+zip'."""
@@ -434,6 +457,7 @@ def main():
 
     tokens = estimate_tokens(text)
     structure = detect_structure(text)
+    chapters = find_chapter_boundaries(text)
     file_size_mb = os.path.getsize(input_path) / (1024 * 1024)
 
     metadata = {
@@ -451,6 +475,7 @@ def main():
         "estimated_tokens_human": f"~{tokens // 1000}K",
         "output_text": str(OUTPUT_TEXT),
         **structure,
+        "chapters": chapters,
     }
 
     OUTPUT_META.write_text(json.dumps(metadata, indent=2, ensure_ascii=False))
