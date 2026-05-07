@@ -490,8 +490,8 @@ def main():
             is_epub = True
         else:
             print(
-                f"ERROR: Unsupported format. Detected ZIP but not EPUB.\n"
-                f"Supported: .pdf, .epub",
+                "ERROR: Unsupported format. Detected ZIP but not EPUB.\n"
+                "Supported: .pdf, .epub",
                 file=sys.stderr,
             )
             sys.exit(1)
@@ -615,7 +615,7 @@ def main():
     OUTPUT_META.write_text(json.dumps(metadata, indent=2, ensure_ascii=False))
 
     page_line = f"   {'Spine items' if is_epub else 'Pages'}: {pages}"
-    print(f"\n📖 Extraction complete:")
+    print("\n📖 Extraction complete:")
     print(f"   Format  : {'EPUB' if is_epub else 'PDF'}")
     print(f"   Method  : {method}")
     book_title = epub_meta.get("title") if is_epub else pdf_info.get("title")

@@ -328,8 +328,12 @@ Quality rules:
 ---
 
 **Oversized chapters**: If a chapter entry has `"oversized": true` (char_count > 80,000),
-split the byte range at the midpoint and dispatch **two** sub-agents instead of one,
-writing `ch{NN}a-<slug>.md` and `ch{NN}b-<slug>.md`. Mark both in the Chapter Index.
+find a semantic split point near the midpoint rather than cutting blindly:
+1. Compute `mid = (offset + end_offset) // 2`
+2. Search within `[mid - 2048, mid + 2048]` for the nearest `\n\n` or `\n#` boundary
+3. Use that boundary as the split; fall back to exact midpoint only if none found
+4. Dispatch **two** sub-agents writing `ch{NN}a-<slug>.md` and `ch{NN}b-<slug>.md`
+Mark both in the Chapter Index.
 
 After all sub-agents return, verify every chapter file:
 ```bash
