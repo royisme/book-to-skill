@@ -78,7 +78,14 @@ If the file is not found or the format is not supported, stop with a clear error
 
 ## Step 1.5 — Identify book type
 
-Before extracting, ask the user:
+First, check whether Docling is installed (only relevant for PDF files):
+
+```bash
+python3 -c "from docling.document_converter import DocumentConverter" 2>/dev/null \
+    && echo "DOCLING_AVAILABLE" || echo "DOCLING_MISSING"
+```
+
+Then ask the user:
 
 > "What kind of content does this book have? This helps me choose the best extraction method.
 >
@@ -91,8 +98,14 @@ Store the answer as `BOOK_TYPE`:
 - Option 2 → `BOOK_TYPE=text`
 - Option 3 → `BOOK_TYPE=text`
 
-**If `BOOK_TYPE=technical`**, inform the user before proceeding:
+**If `BOOK_TYPE=technical` and `DOCLING_AVAILABLE`**, inform the user before proceeding:
 > "📐 Technical mode selected — using Docling for structure-aware extraction (tables, code blocks, formulas preserved as markdown). This takes ~1.5s per page, so expect a few minutes for longer books. Starting now…"
+
+**If `BOOK_TYPE=technical` and `DOCLING_MISSING`**, inform the user:
+> "⚠️  Technical mode selected but Docling is not installed. Falling back to text mode — tables and code blocks will be flattened.
+> To enable technical mode: `pip3 install docling`
+> Continuing with text mode…"
+> Then set `BOOK_TYPE=text`.
 
 **If `BOOK_TYPE=text`**, inform:
 > "📄 Text mode selected — using fast extraction (pdftotext). Ready in seconds."
@@ -123,19 +136,19 @@ Read `/tmp/book_skill_work/metadata.json` to understand what was extracted.
 Read `/tmp/book_skill_work/metadata.json` and present the user with an estimate **before doing any generation**:
 
 ```
-📖 Book detected: <filename> (<format: PDF or EPUB>)
+📖 Book detected: <title or filename> by <author or "unknown"> (<format: PDF or EPUB>)
 📄 Pages/Spine items: ~<N> | Words: ~<N> | Source tokens: ~<N>K
 
 💰 Estimated token cost (Full Conversion):
-   Input  (book reading + prompts): ~<N>K tokens
-   Output (skill files generated):  ~<N>K tokens
+   Input  (book reading + prompts): ~<N>K tokens  [estimated_tokens × 1.3]
+   Output (skill files generated):  ~<N>K tokens  [chapters × 1,000 + 8,500]
    Total:                           ~<N>K tokens
 
-   Reference prices (as of 2025):
-   Claude Sonnet 4.5 → ~$<X> USD
-   Claude Haiku 4.5  → ~$<X> USD
+   Reference prices (2025):
+   Claude Sonnet 4.6  $3 / MTok in  · $15 / MTok out  → ~$<X> USD
+   Claude Haiku 4.5   $0.80 / MTok in · $4 / MTok out → ~$<X> USD
 
-   ⏱  Estimated time: ~<N> minutes
+   ⏱  Estimated time: ~<N> minutes (parallel chapter generation, 4 agents)
 
 📁 Files to be generated:
    SKILL.md + <N> chapter files + glossary + patterns + cheatsheet
@@ -144,9 +157,10 @@ Read `/tmp/book_skill_work/metadata.json` and present the user with an estimate 
 ```
 
 **How to estimate:**
-- Input tokens ≈ `estimated_tokens` from metadata × 1.3 (prompts overhead per chapter pass)
-- Output tokens ≈ chapters × 1,000 + 4,000 (SKILL.md) + 4,500 (glossary + patterns + cheatsheet)
-- Price: Sonnet input=$3/MTok output=$15/MTok — Haiku input=$0.80/MTok output=$4/MTok
+- Input tokens ≈ `estimated_tokens` from metadata × 1.3 (prompt overhead per chapter pass)
+- Output tokens ≈ `chapters_detected` × 1,000 + 4,000 (SKILL.md) + 4,500 (glossary + patterns + cheatsheet)
+- Sonnet 4.6: input=$3/MTok output=$15/MTok — Haiku 4.5: input=$0.80/MTok output=$4/MTok
+- With 4 parallel agents each sub-agent adds ~2K token system-prompt overhead; add `chapters × 2` to input estimate
 
 Wait for the user to confirm before proceeding. If they say "analyze only", switch to Mode 2.
 
@@ -154,13 +168,15 @@ Wait for the user to confirm before proceeding. If they say "analyze only", swit
 
 ## Step 3 — Analyze book structure
 
-Read the first 8,000 characters of `/tmp/book_skill_work/full_text.txt` to identify:
-- Book **title** and **author(s)**
-- **Chapter structure** (look for "Chapter N", "PART I", numbered headings, table of contents)
-- **Core themes** and subject domain
-- Approximate number of chapters
+Read `/tmp/book_skill_work/metadata.json` for `title`, `author`, `chapters_detected`,
+`has_toc`, and the `chapters` array (already extracted — no need to re-scan the text
+for headings).
 
-Then read the Table of Contents section if present to map all chapters.
+Then read the first 8,000 characters of `/tmp/book_skill_work/full_text.txt` to confirm:
+- **Core themes** and subject domain
+- Any chapters or parts missed by the regex (prefaces, appendices, etc.)
+
+If `has_toc` is true in metadata, read that section from the text to get the full chapter list.
 
 **If mode is "Analyze Only":** produce the extraction report now and stop. Structure:
 ```
@@ -311,6 +327,10 @@ Quality rules:
 
 ---
 
+**Oversized chapters**: If a chapter entry has `"oversized": true` (char_count > 80,000),
+split the byte range at the midpoint and dispatch **two** sub-agents instead of one,
+writing `ch{NN}a-<slug>.md` and `ch{NN}b-<slug>.md`. Mark both in the Chapter Index.
+
 After all sub-agents return, verify every chapter file:
 ```bash
 for f in ~/.claude/skills/<skill_name>/chapters/ch*.md; do
@@ -415,13 +435,9 @@ or ask Claude directly.
 
 ---
 
-## Step 10 — Cleanup and report
+## Step 10 — Report and cleanup
 
-```bash
-rm -rf /tmp/book_skill_work
-```
-
-Then report to the user:
+Report to the user first:
 
 ```
 ✅ Skill created: ~/.claude/skills/<skill_name>/
@@ -445,6 +461,16 @@ Usage:
   /<skill_name> <topic>            → find and explain a topic
   /<skill_name> ch<N>              → dive into a specific chapter
 ```
+
+Then clean up the work directory **only after the user sees the report** and all
+chapter files have been verified (Step 7 verification passed):
+
+```bash
+rm -rf /tmp/book_skill_work
+```
+
+If generation failed partway (rate limit, timeout), do NOT delete `/tmp/book_skill_work`.
+The extracted text is needed to resume from Step 7 without re-running extraction.
 
 ---
 

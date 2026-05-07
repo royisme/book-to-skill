@@ -32,6 +32,8 @@ OUTPUT_DIR = Path("/tmp/book_skill_work")
 OUTPUT_TEXT = OUTPUT_DIR / "full_text.txt"
 OUTPUT_META = OUTPUT_DIR / "metadata.json"
 
+CHAPTER_OVERSIZED_CHARS = 80_000  # ~20K tokens; flag for sub-agent splitting
+
 
 def estimate_tokens(text: str) -> int:
     """Token count estimator. Tries tiktoken first, falls back to chars/4."""
@@ -162,6 +164,7 @@ def extract_with_ebooklib(epub_path: str) -> tuple[str, list[dict], dict] | None
                 spine_chapters[i + 1]["offset"] if i + 1 < len(spine_chapters) else len(text)
             )
             ch["char_count"] = ch["end_offset"] - ch["offset"]
+        _flag_oversized(spine_chapters)
         return text, spine_chapters, epub_meta
     except ImportError:
         return None
@@ -289,6 +292,7 @@ def extract_with_zipfile(epub_path: str) -> tuple[str, list[dict], dict] | None:
                     spine_chapters[i + 1]["offset"] if i + 1 < len(spine_chapters) else len(text)
                 )
                 ch["char_count"] = ch["end_offset"] - ch["offset"]
+            _flag_oversized(spine_chapters)
             return text, spine_chapters, epub_meta
     except Exception:
         return None
@@ -323,17 +327,35 @@ def extract_epub(epub_path: str) -> tuple[str, str, list[dict], dict]:
     sys.exit(1)
 
 
-def count_pages(pdf_path: str, extracted_text: str | None = None) -> int:
-    """Count pages, preferring metadata sources, then form-feed in extracted text."""
-    if shutil.which("pdfinfo"):
+def _pdfinfo_fields(pdf_path: str) -> dict[str, str]:
+    """Run pdfinfo once and return all fields as a lowercase-keyed dict."""
+    if not shutil.which("pdfinfo"):
+        return {}
+    try:
+        result = subprocess.run(
+            ["pdfinfo", pdf_path], capture_output=True, text=True, timeout=15
+        )
+        fields: dict[str, str] = {}
+        for line in result.stdout.splitlines():
+            if ":" in line:
+                key, _, val = line.partition(":")
+                fields[key.strip().lower()] = val.strip()
+        return fields
+    except Exception:
+        return {}
+
+
+def count_pages(
+    pdf_path: str,
+    extracted_text: str | None = None,
+    _info: dict | None = None,
+) -> int:
+    """Count pages, preferring pdfinfo, then form-feed chars, then PyPDF2."""
+    info = _info if _info is not None else _pdfinfo_fields(pdf_path)
+    if "pages" in info:
         try:
-            result = subprocess.run(
-                ["pdfinfo", pdf_path], capture_output=True, text=True, timeout=15
-            )
-            for line in result.stdout.splitlines():
-                if line.startswith("Pages:"):
-                    return int(line.split(":")[1].strip())
-        except Exception:
+            return int(info["pages"])
+        except ValueError:
             pass
     # pdftotext (default and -layout) emits \f between pages
     if extracted_text and "\f" in extracted_text:
@@ -344,6 +366,13 @@ def count_pages(pdf_path: str, extracted_text: str | None = None) -> int:
             return len(PyPDF2.PdfReader(f).pages)
     except Exception:
         return 0
+
+
+def _flag_oversized(chapters: list[dict]) -> None:
+    """Mark chapters exceeding CHAPTER_OVERSIZED_CHARS with oversized=True."""
+    for ch in chapters:
+        if ch.get("char_count", 0) > CHAPTER_OVERSIZED_CHARS:
+            ch["oversized"] = True
 
 
 CHAPTER_PATTERN = re.compile(
@@ -379,6 +408,7 @@ def find_chapter_boundaries(text: str) -> tuple[list[dict], dict]:
             boundaries[i + 1]["offset"] if i + 1 < len(boundaries) else len(text)
         )
         b["char_count"] = b["end_offset"] - b["offset"]
+    _flag_oversized(boundaries)
     toc_keywords = ["table of contents", "contents", "目录", "目錄", "índice", "sumário"]
     has_toc = any(kw in text[:5000].lower() for kw in toc_keywords)
     structure = {
@@ -469,6 +499,7 @@ def main():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     epub_meta: dict = {}
+    pdf_info: dict = {}
 
     if is_epub:
         print(f"Extracting EPUB: {input_path}")
@@ -536,7 +567,8 @@ def main():
                         sys.exit(1)
 
         assert text is not None
-        pages = count_pages(input_path, extracted_text=text)
+        pdf_info = _pdfinfo_fields(input_path)
+        pages = count_pages(input_path, extracted_text=text, _info=pdf_info)
         pages_label = "pages"
         chapters, structure = find_chapter_boundaries(text)
 
@@ -566,6 +598,13 @@ def main():
     if not is_epub:
         metadata["extraction_mode_requested"] = requested_mode
         metadata["extraction_mode_used"] = extraction_mode
+        # Title/author from pdfinfo when available
+        pdf_title = pdf_info.get("title") or None
+        pdf_author = pdf_info.get("author") or None
+        if pdf_title:
+            metadata["title"] = pdf_title
+        if pdf_author:
+            metadata["author"] = pdf_author
 
     # Merge EPUB-sourced title/author when present
     if is_epub:
@@ -579,10 +618,12 @@ def main():
     print(f"\n📖 Extraction complete:")
     print(f"   Format  : {'EPUB' if is_epub else 'PDF'}")
     print(f"   Method  : {method}")
-    if is_epub and epub_meta.get("title"):
-        print(f"   Title   : {epub_meta['title']}")
-    if is_epub and epub_meta.get("author"):
-        print(f"   Author  : {epub_meta['author']}")
+    book_title = epub_meta.get("title") if is_epub else pdf_info.get("title")
+    book_author = epub_meta.get("author") if is_epub else pdf_info.get("author")
+    if book_title:
+        print(f"   Title   : {book_title}")
+    if book_author:
+        print(f"   Author  : {book_author}")
     print(page_line)
     print(f"   Words   : {len(text.split()):,}")
     print(f"   Tokens  : ~{tokens // 1000}K")
