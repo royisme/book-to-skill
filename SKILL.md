@@ -5,7 +5,7 @@ when_to_use: Trigger phrases — "turn this book into a skill", "create a skill 
 disable-model-invocation: true
 context: fork
 agent: general-purpose
-allowed-tools: Bash(python3 *) Bash(pdftotext *) Bash(mkdir *) Bash(cp *) Bash(find *) Bash(wc *) Bash(echo *) Bash(cat *) Bash(date *) Read Write Glob Grep
+allowed-tools: Bash(python3 *) Bash(pdftotext *) Bash(mkdir *) Bash(cp *) Bash(find *) Bash(wc *) Bash(echo *) Bash(cat *) Bash(date *) Bash(ls *) Bash(file *) Read Write Glob Grep Task
 argument-hint: <path-to-pdf-or-epub> [skill-name-slug]
 arguments: [book_path, skill_name]
 effort: high
@@ -63,8 +63,11 @@ If the argument is NOT a path to a PDF or EPUB file, stop and respond:
 ## Step 1 — Validate input
 
 ```bash
-test -f "$0" && echo "FILE_OK" || echo "FILE_NOT_FOUND: $0"
-file "$0" | grep -iE "pdf|epub|zip" && echo "FORMAT_OK" || echo "FORMAT_UNKNOWN"
+BOOK_PATH="$1"
+SKILL_NAME_ARG="${2:-}"
+test -f "$BOOK_PATH" && echo "FILE_OK" || echo "FILE_NOT_FOUND: $BOOK_PATH"
+file "$BOOK_PATH" | grep -iE "pdf|epub|zip" \
+    && echo "FORMAT_OK" || echo "FORMAT_UNKNOWN"
 ```
 
 Check the file extension (`.pdf` or `.epub`) or magic bytes (`%PDF` or `PK` zip header).
@@ -75,7 +78,14 @@ If the file is not found or the format is not supported, stop with a clear error
 
 ## Step 1.5 — Identify book type
 
-Before extracting, ask the user:
+First, check whether Docling is installed (only relevant for PDF files):
+
+```bash
+python3 -c "from docling.document_converter import DocumentConverter" 2>/dev/null \
+    && echo "DOCLING_AVAILABLE" || echo "DOCLING_MISSING"
+```
+
+Then ask the user:
 
 > "What kind of content does this book have? This helps me choose the best extraction method.
 >
@@ -88,8 +98,14 @@ Store the answer as `BOOK_TYPE`:
 - Option 2 → `BOOK_TYPE=text`
 - Option 3 → `BOOK_TYPE=text`
 
-**If `BOOK_TYPE=technical`**, inform the user before proceeding:
+**If `BOOK_TYPE=technical` and `DOCLING_AVAILABLE`**, inform the user before proceeding:
 > "📐 Technical mode selected — using Docling for structure-aware extraction (tables, code blocks, formulas preserved as markdown). This takes ~1.5s per page, so expect a few minutes for longer books. Starting now…"
+
+**If `BOOK_TYPE=technical` and `DOCLING_MISSING`**, inform the user:
+> "⚠️  Technical mode selected but Docling is not installed. Falling back to text mode — tables and code blocks will be flattened.
+> To enable technical mode: `pip3 install docling`
+> Continuing with text mode…"
+> Then set `BOOK_TYPE=text`.
 
 **If `BOOK_TYPE=text`**, inform:
 > "📄 Text mode selected — using fast extraction (pdftotext). Ready in seconds."
@@ -101,7 +117,7 @@ Store the answer as `BOOK_TYPE`:
 Run the extraction script, passing the book type:
 
 ```bash
-python3 ~/.claude/skills/book-to-skill/scripts/extract.py "$0" --mode <BOOK_TYPE>
+python3 ~/.claude/skills/book-to-skill/scripts/extract.py "$BOOK_PATH" --mode <BOOK_TYPE>
 ```
 
 - `--mode technical` → uses Docling (layout-aware, preserves tables and code blocks as markdown)
@@ -120,19 +136,19 @@ Read `/tmp/book_skill_work/metadata.json` to understand what was extracted.
 Read `/tmp/book_skill_work/metadata.json` and present the user with an estimate **before doing any generation**:
 
 ```
-📖 Book detected: <filename> (<format: PDF or EPUB>)
+📖 Book detected: <title or filename> by <author or "unknown"> (<format: PDF or EPUB>)
 📄 Pages/Spine items: ~<N> | Words: ~<N> | Source tokens: ~<N>K
 
 💰 Estimated token cost (Full Conversion):
-   Input  (book reading + prompts): ~<N>K tokens
-   Output (skill files generated):  ~<N>K tokens
+   Input  (book reading + prompts): ~<N>K tokens  [estimated_tokens × 1.3]
+   Output (skill files generated):  ~<N>K tokens  [chapters × 1,000 + 8,500]
    Total:                           ~<N>K tokens
 
-   Reference prices (as of 2025):
-   Claude Sonnet 4.5 → ~$<X> USD
-   Claude Haiku 4.5  → ~$<X> USD
+   Reference prices (2025):
+   Claude Sonnet 4.6  $3 / MTok in  · $15 / MTok out  → ~$<X> USD
+   Claude Haiku 4.5   $0.80 / MTok in · $4 / MTok out → ~$<X> USD
 
-   ⏱  Estimated time: ~<N> minutes
+   ⏱  Estimated time: ~<N> minutes (parallel chapter generation, 4 agents)
 
 📁 Files to be generated:
    SKILL.md + <N> chapter files + glossary + patterns + cheatsheet
@@ -141,9 +157,10 @@ Read `/tmp/book_skill_work/metadata.json` and present the user with an estimate 
 ```
 
 **How to estimate:**
-- Input tokens ≈ `estimated_tokens` from metadata × 1.3 (prompts overhead per chapter pass)
-- Output tokens ≈ chapters × 1,000 + 4,000 (SKILL.md) + 4,500 (glossary + patterns + cheatsheet)
-- Price: Sonnet input=$3/MTok output=$15/MTok — Haiku input=$0.80/MTok output=$4/MTok
+- Input tokens ≈ `estimated_tokens` from metadata × 1.3 (prompt overhead per chapter pass)
+- Output tokens ≈ `chapters_detected` × 1,000 + 4,000 (SKILL.md) + 4,500 (glossary + patterns + cheatsheet)
+- Sonnet 4.6: input=$3/MTok output=$15/MTok — Haiku 4.5: input=$0.80/MTok output=$4/MTok
+- With 4 parallel agents each sub-agent adds ~2K token system-prompt overhead; add `chapters × 2` to input estimate
 
 Wait for the user to confirm before proceeding. If they say "analyze only", switch to Mode 2.
 
@@ -151,13 +168,15 @@ Wait for the user to confirm before proceeding. If they say "analyze only", swit
 
 ## Step 3 — Analyze book structure
 
-Read the first 8,000 characters of `/tmp/book_skill_work/full_text.txt` to identify:
-- Book **title** and **author(s)**
-- **Chapter structure** (look for "Chapter N", "PART I", numbered headings, table of contents)
-- **Core themes** and subject domain
-- Approximate number of chapters
+Read `/tmp/book_skill_work/metadata.json` for `title`, `author`, `chapters_detected`,
+`has_toc`, and the `chapters` array (already extracted — no need to re-scan the text
+for headings).
 
-Then read the Table of Contents section if present to map all chapters.
+Then read the first 8,000 characters of `/tmp/book_skill_work/full_text.txt` to confirm:
+- **Core themes** and subject domain
+- Any chapters or parts missed by the regex (prefaces, appendices, etc.)
+
+If `has_toc` is true in metadata, read that section from the text to get the full chapter list.
 
 **If mode is "Analyze Only":** produce the extraction report now and stop. Structure:
 ```
@@ -200,7 +219,7 @@ Use the answer to weight what gets highlighted in the SKILL.md Core section.
 
 ## Step 5 — Determine skill name
 
-If `$1` was provided, use it as the skill slug.
+If `$SKILL_NAME_ARG` is non-empty, use it as the skill slug.
 Otherwise, propose two options and let the user choose:
 - **By author-concept**: `{author-lastname}-{core-concept}` (e.g. `cialdini-influence`, `meadows-systems`)
 - **By title**: lowercase hyphens from book title (e.g. `designing-data-intensive-apps`)
@@ -220,24 +239,45 @@ mkdir -p ~/.claude/skills/<skill_name>/chapters
 
 ---
 
-## Step 7 — Generate chapter summaries
+## Step 7 — Generate chapter summaries (parallel)
 
-**TOKEN BUDGET RULE — CRITICAL:**
-- Each chapter summary file: **800–1,200 tokens** (dense, not verbose)
-- Files are loaded on-demand — they are NOT capped per se, but keep them useful and tight
+Read `chapters` array from `/tmp/book_skill_work/metadata.json`. Also read
+`extraction_mode_used` and `filename` from the same file.
 
-For EACH chapter/major section identified in Step 3:
+For each chapter entry `c` (with fields `title`, `offset`, `end_offset`, `char_count`),
+dispatch a sub-agent via the **Task tool**. Run up to **4 sub-agents in parallel** to
+balance throughput against rate limits. Wait for each batch of 4 to complete before
+launching the next batch.
 
-Read the corresponding section of `/tmp/book_skill_work/full_text.txt` (use character offsets or grep for chapter headings).
+Use this prompt template for each sub-agent (substitute values before dispatching):
 
-Create `~/.claude/skills/<skill_name>/chapters/ch<NN>-<slug>.md` using the structure below.
+---
+**CHAPTER_TEMPLATE** — pass verbatim as the sub-agent prompt:
 
-**Adapt emphasis based on `BOOK_TYPE`:**
-- `technical` → prioritize "Code Examples", "Reference Tables", and "Commands & APIs" sections; preserve exact syntax
-- `text` → prioritize "Frameworks Introduced", "Mental Models", and "Key Takeaways"; skip empty technical sections
+```
+You are generating ONE chapter summary file for a book skill.
 
-```markdown
-# Chapter N: <Full Title>
+Inputs:
+  text_file:    /tmp/book_skill_work/full_text.txt
+  offset:       {c.offset}
+  end_offset:   {c.end_offset}
+  chapter_title: {c.title}
+  chapter_index: {NN}   (zero-padded two digits, e.g. 01, 02)
+  mode:         {extraction_mode_used}   (technical | text)
+  skill_name:   {skill_name}
+  output_path:  ~/.claude/skills/{skill_name}/chapters/ch{NN}-{slug}.md
+                where {slug} is a lowercase-hyphenated version of chapter_title
+
+Steps:
+  1. Read bytes [offset, end_offset] from text_file.
+  2. Check: if output_path already exists AND its size > 500 bytes, print
+     "Skipping ch{NN} — already complete." and exit successfully.
+  3. Write output_path using the CHAPTER FORMAT below.
+  4. Confirm: print file size in bytes. If < 500 bytes, print a warning.
+
+CHAPTER FORMAT:
+---
+# Chapter {NN}: {chapter_title}
 
 ## Core Idea
 <1–2 sentences: the single most important thing this chapter teaches>
@@ -257,15 +297,15 @@ Create `~/.claude/skills/<skill_name>/chapters/ch<NN>-<slug>.md` using the struc
 ## Anti-patterns
 - **<What to avoid>**: <why it fails>
 
-## Code Examples *(technical books only — omit if BOOK_TYPE=text)*
-<!-- Copy the most instructive snippet from the chapter. Preserve indentation exactly. -->
+## Code Examples *(omit entirely if mode=text)*
+<!-- Copy the most instructive snippet. Preserve indentation exactly. -->
 ```<language>
-<key code example from this chapter>
+<key code example>
 ```
 - **What it demonstrates**: <one line>
 
-## Reference Tables *(technical books only — omit if BOOK_TYPE=text)*
-<!-- Reproduce any comparison matrix, parameter table, or decision table from the chapter in markdown. -->
+## Reference Tables *(omit entirely if mode=text)*
+<!-- Reproduce any comparison matrix, parameter table, or decision table in markdown. -->
 
 ## Key Takeaways
 1. <Actionable insight>
@@ -276,7 +316,33 @@ Create `~/.claude/skills/<skill_name>/chapters/ch<NN>-<slug>.md` using the struc
 ## Connects To
 - **Ch N**: <why this chapter relates>
 - **<Concept>**: <external concept or standard it connects with>
+---
+
+Quality rules:
+- Extract structure (named frameworks, anti-patterns), not summaries.
+- Preserve the author's exact framework names.
+- Practitioner voice: "Use X when Y", not "The book explains X".
+- Token budget: 800–1,200 tokens per file.
 ```
+
+---
+
+**Oversized chapters**: If a chapter entry has `"oversized": true` (char_count > 80,000),
+find a semantic split point near the midpoint rather than cutting blindly:
+1. Compute `mid = (offset + end_offset) // 2`
+2. Search within `[mid - 2048, mid + 2048]` for the nearest `\n\n` or `\n#` boundary
+3. Use that boundary as the split; fall back to exact midpoint only if none found
+4. Dispatch **two** sub-agents writing `ch{NN}a-<slug>.md` and `ch{NN}b-<slug>.md`
+Mark both in the Chapter Index.
+
+After all sub-agents return, verify every chapter file:
+```bash
+for f in ~/.claude/skills/<skill_name>/chapters/ch*.md; do
+    size=$(wc -c < "$f")
+    [ "$size" -lt 500 ] && echo "INCOMPLETE: $f ($size bytes)"
+done
+```
+Re-dispatch sub-agents for any chapter that is missing or under 500 bytes.
 
 ---
 
@@ -373,13 +439,9 @@ or ask Claude directly.
 
 ---
 
-## Step 10 — Cleanup and report
+## Step 10 — Report and cleanup
 
-```bash
-rm -rf /tmp/book_skill_work
-```
-
-Then report to the user:
+Report to the user first:
 
 ```
 ✅ Skill created: ~/.claude/skills/<skill_name>/
@@ -403,6 +465,16 @@ Usage:
   /<skill_name> <topic>            → find and explain a topic
   /<skill_name> ch<N>              → dive into a specific chapter
 ```
+
+Then clean up the work directory **only after the user sees the report** and all
+chapter files have been verified (Step 7 verification passed):
+
+```bash
+rm -rf /tmp/book_skill_work
+```
+
+If generation failed partway (rate limit, timeout), do NOT delete `/tmp/book_skill_work`.
+The extracted text is needed to resume from Step 7 without re-running extraction.
 
 ---
 
