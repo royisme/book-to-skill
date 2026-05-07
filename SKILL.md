@@ -223,34 +223,45 @@ mkdir -p ~/.claude/skills/<skill_name>/chapters
 
 ---
 
-## Step 7 — Generate chapter summaries
+## Step 7 — Generate chapter summaries (parallel)
 
-**Resume rule**: Before generating each chapter file, check whether it already exists
-and is non-trivial:
-```bash
-EXISTING=$(ls ~/.claude/skills/<skill_name>/chapters/ch<NN>-*.md 2>/dev/null | head -1)
-if [ -n "$EXISTING" ] && [ "$(wc -c < "$EXISTING")" -gt 500 ]; then
-    echo "Chapter <NN> already exists at $EXISTING — skipping."
-    # continue to next chapter
-fi
+Read `chapters` array from `/tmp/book_skill_work/metadata.json`. Also read
+`extraction_mode_used` and `filename` from the same file.
+
+For each chapter entry `c` (with fields `title`, `offset`, `end_offset`, `char_count`),
+dispatch a sub-agent via the **Task tool**. Run up to **4 sub-agents in parallel** to
+balance throughput against rate limits. Wait for each batch of 4 to complete before
+launching the next batch.
+
+Use this prompt template for each sub-agent (substitute values before dispatching):
+
+---
+**CHAPTER_TEMPLATE** — pass verbatim as the sub-agent prompt:
+
 ```
-If a chapter file is empty or under 500 bytes, treat it as incomplete and regenerate.
+You are generating ONE chapter summary file for a book skill.
 
-**TOKEN BUDGET RULE — CRITICAL:**
-- Each chapter summary file: **800–1,200 tokens** (dense, not verbose)
-- Files are loaded on-demand — they are NOT capped per se, but keep them useful and tight
+Inputs:
+  text_file:    /tmp/book_skill_work/full_text.txt
+  offset:       {c.offset}
+  end_offset:   {c.end_offset}
+  chapter_title: {c.title}
+  chapter_index: {NN}   (zero-padded two digits, e.g. 01, 02)
+  mode:         {extraction_mode_used}   (technical | text)
+  skill_name:   {skill_name}
+  output_path:  ~/.claude/skills/{skill_name}/chapters/ch{NN}-{slug}.md
+                where {slug} is a lowercase-hyphenated version of chapter_title
 
-Read `chapters` array from `/tmp/book_skill_work/metadata.json`. For each entry,
-slice `full_text.txt` by `[offset, end_offset]` — do NOT grep for headings.
+Steps:
+  1. Read bytes [offset, end_offset] from text_file.
+  2. Check: if output_path already exists AND its size > 500 bytes, print
+     "Skipping ch{NN} — already complete." and exit successfully.
+  3. Write output_path using the CHAPTER FORMAT below.
+  4. Confirm: print file size in bytes. If < 500 bytes, print a warning.
 
-Create `~/.claude/skills/<skill_name>/chapters/ch<NN>-<slug>.md` using the structure below.
-
-**Adapt emphasis based on `extraction_mode_used` from `metadata.json`:**
-- `technical` → prioritize "Code Examples", "Reference Tables", and "Commands & APIs" sections; preserve exact syntax
-- `text` → prioritize "Frameworks Introduced", "Mental Models", and "Key Takeaways"; skip empty technical sections
-
-```markdown
-# Chapter N: <Full Title>
+CHAPTER FORMAT:
+---
+# Chapter {NN}: {chapter_title}
 
 ## Core Idea
 <1–2 sentences: the single most important thing this chapter teaches>
@@ -270,15 +281,15 @@ Create `~/.claude/skills/<skill_name>/chapters/ch<NN>-<slug>.md` using the struc
 ## Anti-patterns
 - **<What to avoid>**: <why it fails>
 
-## Code Examples *(technical books only — omit if BOOK_TYPE=text)*
-<!-- Copy the most instructive snippet from the chapter. Preserve indentation exactly. -->
+## Code Examples *(omit entirely if mode=text)*
+<!-- Copy the most instructive snippet. Preserve indentation exactly. -->
 ```<language>
-<key code example from this chapter>
+<key code example>
 ```
 - **What it demonstrates**: <one line>
 
-## Reference Tables *(technical books only — omit if BOOK_TYPE=text)*
-<!-- Reproduce any comparison matrix, parameter table, or decision table from the chapter in markdown. -->
+## Reference Tables *(omit entirely if mode=text)*
+<!-- Reproduce any comparison matrix, parameter table, or decision table in markdown. -->
 
 ## Key Takeaways
 1. <Actionable insight>
@@ -289,7 +300,25 @@ Create `~/.claude/skills/<skill_name>/chapters/ch<NN>-<slug>.md` using the struc
 ## Connects To
 - **Ch N**: <why this chapter relates>
 - **<Concept>**: <external concept or standard it connects with>
+---
+
+Quality rules:
+- Extract structure (named frameworks, anti-patterns), not summaries.
+- Preserve the author's exact framework names.
+- Practitioner voice: "Use X when Y", not "The book explains X".
+- Token budget: 800–1,200 tokens per file.
 ```
+
+---
+
+After all sub-agents return, verify every chapter file:
+```bash
+for f in ~/.claude/skills/<skill_name>/chapters/ch*.md; do
+    size=$(wc -c < "$f")
+    [ "$size" -lt 500 ] && echo "INCOMPLETE: $f ($size bytes)"
+done
+```
+Re-dispatch sub-agents for any chapter that is missing or under 500 bytes.
 
 ---
 
