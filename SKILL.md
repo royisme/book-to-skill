@@ -5,7 +5,7 @@ when_to_use: Trigger phrases — "turn this book into a skill", "create a skill 
 disable-model-invocation: true
 context: fork
 agent: general-purpose
-allowed-tools: Bash(python3 *) Bash(pdftotext *) Bash(mkdir *) Bash(cp *) Bash(find *) Bash(wc *) Bash(echo *) Bash(cat *) Bash(date *) Read Write Glob Grep
+allowed-tools: Bash(python3 *) Bash(pdftotext *) Bash(mkdir *) Bash(cp *) Bash(find *) Bash(wc *) Bash(echo *) Bash(cat *) Bash(date *) Bash(ls *) Bash(file *) Read Write Glob Grep Task
 argument-hint: <path-to-pdf-or-epub> [skill-name-slug]
 arguments: [book_path, skill_name]
 effort: high

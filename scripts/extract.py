@@ -32,6 +32,7 @@ OUTPUT_DIR = Path("/tmp/book_skill_work")
 OUTPUT_TEXT = OUTPUT_DIR / "full_text.txt"
 OUTPUT_META = OUTPUT_DIR / "metadata.json"
 
+
 def estimate_tokens(text: str) -> int:
     """Token count estimator. Tries tiktoken first, falls back to chars/4."""
     try:
@@ -43,6 +44,31 @@ def estimate_tokens(text: str) -> int:
         return max(1, len(text) // 4)
     except Exception:
         return max(1, len(text) // 4)
+
+
+def _epub_meta_from_opf(opf_text: str) -> dict:
+    """Extract title and author from raw OPF XML text via regex."""
+    title_m = re.search(r'<dc:title[^>]*>([^<]+)</dc:title>', opf_text, re.IGNORECASE)
+    author_m = re.search(r'<dc:creator[^>]*>([^<]+)</dc:creator>', opf_text, re.IGNORECASE)
+    return {
+        "title": html.unescape(title_m.group(1).strip()) if title_m else None,
+        "author": html.unescape(author_m.group(1).strip()) if author_m else None,
+    }
+
+
+def _extract_html_heading(raw_html: str) -> str | None:
+    """Return the first h1/h2/h3 or <title> text from an HTML document."""
+    for pattern in (
+        r'<h[1-3][^>]*>(.*?)</h[1-3]>',
+        r'<title[^>]*>(.*?)</title>',
+    ):
+        m = re.search(pattern, raw_html, re.IGNORECASE | re.DOTALL)
+        if m:
+            inner = re.sub(r'<[^>]+>', '', m.group(1))
+            text = html.unescape(inner).strip()
+            if text:
+                return text
+    return None
 
 
 def extract_with_pdftotext(pdf_path: str) -> str | None:
@@ -88,18 +114,55 @@ def extract_with_pdfminer(pdf_path: str) -> str | None:
         return None
 
 
-def extract_with_ebooklib(epub_path: str) -> str | None:
+def extract_with_ebooklib(epub_path: str) -> tuple[str, list[dict], dict] | None:
+    """Return (text, spine_chapters, epub_meta) or None."""
     try:
         import ebooklib
         from ebooklib import epub
         from bs4 import BeautifulSoup
 
         book = epub.read_epub(epub_path)
-        parts = []
-        for item in book.get_items_of_type(ebooklib.ITEM_DOCUMENT):
+
+        title_list = book.get_metadata('DC', 'title')
+        author_list = book.get_metadata('DC', 'creator')
+        epub_meta = {
+            "title": title_list[0][0] if title_list else None,
+            "author": author_list[0][0] if author_list else None,
+        }
+
+        # Use spine order, not arbitrary item order
+        spine_ids = [sid for (sid, _) in book.spine]
+        items = {
+            item.get_id(): item
+            for item in book.get_items_of_type(ebooklib.ITEM_DOCUMENT)
+        }
+
+        parts: list[str] = []
+        spine_chapters: list[dict] = []
+        pos = 0
+        for spine_id in spine_ids:
+            item = items.get(spine_id)
+            if item is None:
+                continue
             soup = BeautifulSoup(item.get_content(), "html.parser")
-            parts.append(soup.get_text(separator="\n"))
-        return "\n\n".join(parts)
+            heading_tag = soup.find(['h1', 'h2', 'h3'])
+            heading = heading_tag.get_text().strip() if heading_tag else item.get_name()
+            part = soup.get_text(separator="\n")
+            if not part.strip():
+                continue
+            spine_chapters.append({"title": heading, "offset": pos})
+            parts.append(part)
+            pos += len(part) + 2  # +2 for "\n\n" separator
+
+        if not parts:
+            return None
+        text = "\n\n".join(parts)
+        for i, ch in enumerate(spine_chapters):
+            ch["end_offset"] = (
+                spine_chapters[i + 1]["offset"] if i + 1 < len(spine_chapters) else len(text)
+            )
+            ch["char_count"] = ch["end_offset"] - ch["offset"]
+        return text, spine_chapters, epub_meta
     except ImportError:
         return None
     except Exception:
@@ -115,7 +178,6 @@ class _HTMLTextExtractor(html.parser.HTMLParser):
         super().__init__()
         self._parts: list[str] = []
         self._skip_depth = 0
-        self._current_skip: str | None = None
 
     def handle_starttag(self, tag, attrs):
         if tag in self.SKIP_TAGS:
@@ -135,8 +197,8 @@ class _HTMLTextExtractor(html.parser.HTMLParser):
         return html.unescape("".join(self._parts))
 
 
-def extract_with_zipfile(epub_path: str) -> str | None:
-    """stdlib-only EPUB extractor: unzip → parse OPF spine → extract HTML."""
+def extract_with_zipfile(epub_path: str) -> tuple[str, list[dict], dict] | None:
+    """stdlib-only EPUB extractor. Returns (text, spine_chapters, epub_meta) or None."""
     try:
         import xml.etree.ElementTree as ET
         with zipfile.ZipFile(epub_path) as zf:
@@ -157,14 +219,18 @@ def extract_with_zipfile(epub_path: str) -> str | None:
                 if not opf_candidates:
                     return None
                 opf_path = opf_candidates[0]
+
             opf_dir = os.path.dirname(opf_path)
             opf_text = zf.read(opf_path).decode("utf-8", errors="replace")
+            epub_meta = _epub_meta_from_opf(opf_text)
+
             # Strip XML namespaces to make ElementTree queries simple
             opf_text_clean = re.sub(r'\sxmlns(:[^=]+)?="[^"]+"', "", opf_text, count=0)
             try:
                 root = ET.fromstring(opf_text_clean)
             except ET.ParseError:
                 return None
+
             # Build manifest: id -> href
             manifest: dict[str, str] = {}
             for item in root.findall(".//manifest/item"):
@@ -172,6 +238,7 @@ def extract_with_zipfile(epub_path: str) -> str | None:
                 href = item.get("href")
                 if item_id and href:
                     manifest[item_id] = href
+
             # Resolve spine in reading order
             spine_files: list[str] = []
             for itemref in root.findall(".//spine/itemref"):
@@ -184,6 +251,7 @@ def extract_with_zipfile(epub_path: str) -> str | None:
                 ).replace("\\", "/")
                 if full in names:
                     spine_files.append(full)
+
             # Fall back: any html/xhtml under the archive
             if not spine_files:
                 spine_files = sorted(
@@ -191,34 +259,59 @@ def extract_with_zipfile(epub_path: str) -> str | None:
                 )
             if not spine_files:
                 return None
+
             parts: list[str] = []
+            spine_chapters: list[dict] = []
+            pos = 0
             for name in spine_files:
                 try:
                     raw = zf.read(name).decode("utf-8", errors="replace")
+                    heading = _extract_html_heading(raw)
                     parser = _HTMLTextExtractor()
                     parser.feed(raw)
-                    parts.append(parser.get_text())
+                    part = parser.get_text()
+                    if not part.strip():
+                        continue
+                    spine_chapters.append({
+                        "title": heading or os.path.basename(name),
+                        "offset": pos,
+                    })
+                    parts.append(part)
+                    pos += len(part) + 2  # +2 for "\n\n" separator
                 except Exception:
                     continue
-            return "\n\n".join(parts) if parts else None
+
+            if not parts:
+                return None
+            text = "\n\n".join(parts)
+            for i, ch in enumerate(spine_chapters):
+                ch["end_offset"] = (
+                    spine_chapters[i + 1]["offset"] if i + 1 < len(spine_chapters) else len(text)
+                )
+                ch["char_count"] = ch["end_offset"] - ch["offset"]
+            return text, spine_chapters, epub_meta
     except Exception:
         return None
 
 
-def extract_epub(epub_path: str) -> tuple[str, str]:
-    """Return (text, method) for an EPUB file."""
+def extract_epub(epub_path: str) -> tuple[str, str, list[dict], dict]:
+    """Return (text, method, spine_chapters, epub_meta)."""
     print("Trying ebooklib + BeautifulSoup4...", end=" ", flush=True)
-    text = extract_with_ebooklib(epub_path)
-    if text and text.strip():
-        print("OK")
-        return text, "ebooklib"
+    result = extract_with_ebooklib(epub_path)
+    if result:
+        text, spine_chapters, epub_meta = result
+        if text.strip():
+            print("OK")
+            return text, "ebooklib", spine_chapters, epub_meta
 
     print("not available")
     print("Trying stdlib zipfile parser...", end=" ", flush=True)
-    text = extract_with_zipfile(epub_path)
-    if text and text.strip():
-        print("OK")
-        return text, "zipfile"
+    result = extract_with_zipfile(epub_path)
+    if result:
+        text, spine_chapters, epub_meta = result
+        if text.strip():
+            print("OK")
+            return text, "zipfile", spine_chapters, epub_meta
 
     print("FAILED")
     print(
@@ -228,19 +321,6 @@ def extract_epub(epub_path: str) -> tuple[str, str]:
         file=sys.stderr,
     )
     sys.exit(1)
-
-
-def count_epub_chapters(epub_path: str) -> int:
-    """Count spine items (approximate chapter count) without dependencies."""
-    try:
-        with zipfile.ZipFile(epub_path) as zf:
-            opf_files = [n for n in zf.namelist() if n.endswith(".opf")]
-            if not opf_files:
-                return 0
-            opf_text = zf.read(opf_files[0]).decode("utf-8", errors="replace")
-            return len(re.findall(r'<itemref\b', opf_text))
-    except Exception:
-        return 0
 
 
 def count_pages(pdf_path: str, extracted_text: str | None = None) -> int:
@@ -278,39 +358,35 @@ CHAPTER_PATTERN = re.compile(
 )
 
 
-def detect_structure(text: str) -> dict:
-    """Detect chapter count and table of contents presence.
-    Scans the entire text, not just the first 50K chars."""
+def find_chapter_boundaries(text: str) -> tuple[list[dict], dict]:
+    """Scan text once; return (boundaries, structure_info).
+
+    Replaces the former separate detect_structure + find_chapter_boundaries calls.
+    """
     matches = list(CHAPTER_PATTERN.finditer(text))
-    headings_sample = []
-    for m in matches[:10]:
-        line_end = text.find("\n", m.start())
-        line = text[m.start(): line_end if line_end != -1 else m.start() + 120]
-        headings_sample.append(line.strip())
-    toc_keywords = ["table of contents", "contents", "目录", "目錄", "índice", "sumário"]
-    has_toc = any(kw in text[:5000].lower() for kw in toc_keywords)
-    return {
-        "chapters_detected": len(matches),
-        "chapter_headings_sample": headings_sample,
-        "has_toc": has_toc,
-    }
-
-
-def find_chapter_boundaries(text: str) -> list[dict]:
-    """Locate chapter starts and end offsets. End of chapter N == start of N+1."""
     boundaries: list[dict] = []
-    for m in CHAPTER_PATTERN.finditer(text):
+    headings_sample: list[str] = []
+    for m in matches:
         line_end = text.find("\n", m.start())
         if line_end == -1:
             line_end = m.start() + 120
         title = text[m.start():line_end].strip()
+        if len(headings_sample) < 10:
+            headings_sample.append(title)
         boundaries.append({"title": title, "offset": m.start()})
     for i, b in enumerate(boundaries):
         b["end_offset"] = (
             boundaries[i + 1]["offset"] if i + 1 < len(boundaries) else len(text)
         )
         b["char_count"] = b["end_offset"] - b["offset"]
-    return boundaries
+    toc_keywords = ["table of contents", "contents", "目录", "目錄", "índice", "sumário"]
+    has_toc = any(kw in text[:5000].lower() for kw in toc_keywords)
+    structure = {
+        "chapters_detected": len(boundaries),
+        "chapter_headings_sample": headings_sample,
+        "has_toc": has_toc,
+    }
+    return boundaries, structure
 
 
 def _is_epub_zip(path: str) -> bool:
@@ -392,12 +468,22 @@ def main():
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
+    epub_meta: dict = {}
+
     if is_epub:
         print(f"Extracting EPUB: {input_path}")
-        text, method = extract_epub(input_path)
-        pages = count_epub_chapters(input_path)
+        text, method, chapters, epub_meta = extract_epub(input_path)
+        pages = len(chapters)
         pages_label = "spine_items"
+        toc_keywords = ["table of contents", "contents", "目录", "目錄", "índice", "sumário"]
+        has_toc = any(kw in text[:5000].lower() for kw in toc_keywords)
+        structure = {
+            "chapters_detected": len(chapters),
+            "chapter_headings_sample": [c["title"] for c in chapters[:10]],
+            "has_toc": has_toc,
+        }
     else:
+        text: str | None = None
         print(f"Extracting PDF: {input_path}")
         if extraction_mode == "technical":
             print("Mode: technical — using Docling (layout-aware)...", end=" ", flush=True)
@@ -449,24 +535,22 @@ def main():
                         )
                         sys.exit(1)
 
+        assert text is not None
         pages = count_pages(input_path, extracted_text=text)
         pages_label = "pages"
+        chapters, structure = find_chapter_boundaries(text)
 
     # Write full text
     OUTPUT_TEXT.write_text(text, encoding="utf-8")
 
     tokens = estimate_tokens(text)
-    structure = detect_structure(text)
-    chapters = find_chapter_boundaries(text)
     file_size_mb = os.path.getsize(input_path) / (1024 * 1024)
 
-    metadata = {
+    metadata: dict = {
         "source_file": str(Path(input_path).resolve()),
         "filename": Path(input_path).name,
         "format": "epub" if is_epub else "pdf",
         "extraction_method": method,
-        "extraction_mode_requested": requested_mode,
-        "extraction_mode_used": extraction_mode,
         "file_size_mb": round(file_size_mb, 2),
         pages_label: pages,
         "chars": len(text),
@@ -478,12 +562,27 @@ def main():
         "chapters": chapters,
     }
 
+    # Mode fields only apply to PDF (EPUB extraction has no mode selection)
+    if not is_epub:
+        metadata["extraction_mode_requested"] = requested_mode
+        metadata["extraction_mode_used"] = extraction_mode
+
+    # Merge EPUB-sourced title/author when present
+    if is_epub:
+        for key in ("title", "author"):
+            if epub_meta.get(key):
+                metadata[key] = epub_meta[key]
+
     OUTPUT_META.write_text(json.dumps(metadata, indent=2, ensure_ascii=False))
 
     page_line = f"   {'Spine items' if is_epub else 'Pages'}: {pages}"
     print(f"\n📖 Extraction complete:")
     print(f"   Format  : {'EPUB' if is_epub else 'PDF'}")
     print(f"   Method  : {method}")
+    if is_epub and epub_meta.get("title"):
+        print(f"   Title   : {epub_meta['title']}")
+    if is_epub and epub_meta.get("author"):
+        print(f"   Author  : {epub_meta['author']}")
     print(page_line)
     print(f"   Words   : {len(text.split()):,}")
     print(f"   Tokens  : ~{tokens // 1000}K")
